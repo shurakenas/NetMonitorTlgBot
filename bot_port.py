@@ -148,7 +148,8 @@ async def check_server(server, retries=3, delay=1):
                 response_time = round((asyncio.get_event_loop().time() - start_time) * 1000)  # Время в мс
                 conn.close()
                 return {"ip": ip, "status": True, "response_time": response_time}
-        except (socket.timeout, socket.error):
+        except (socket.timeout, socket.error) as e:
+            logging.info(f"Попытка подключения {attempt + 1} к серверу {ip} не удалась: {str(e)}")
             if attempt < retries - 1:
                 await asyncio.sleep(delay)  # Пауза перед повторной попыткой
             else:
