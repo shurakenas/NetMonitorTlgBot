@@ -5,19 +5,23 @@ import socket
 import json
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ParseMode
 import logging
 import os
 import time
 from collections import deque
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.dates import MinuteLocator, DateFormatter
+from datetime import datetime
 from itertools import islice
+
 
 from config import *
 
 #Настройка логирования
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('log/bot.log'),  # Запись в файл
@@ -25,14 +29,16 @@ logging.basicConfig(
     ]
 )
 
+logger = logging.getLogger()
+
 #Инициализация бота, диспетчера
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
 #Обработчик ошибок
 @dp.errors_handler()
-async def error_bot(update: types.Update, exception: Exception):
-    print(f'Update: {update} \nException: {exception}')
+async def error_bot(update: types.Update, e: Exception):
+    logger.error(f'Exception: {str(e)}')
     await bot.send_message(chat_id=CHAT_ID, text='Какая-то ошибка, проверьте логи!')
     return True
 
@@ -74,11 +80,6 @@ def load_status():
                     if not isinstance(server_stats[ip], deque) or len(server_stats[ip]) == 0:
                         server_stats[ip] = deque(maxlen=10000)
 
-                # Проверяем инициализацию server_stats
-#                for ip in server_stats:
-#                    if not all(key in server_stats[ip] for key in ("total_checks", "successful_checks", "failed_checks")):
-#                        server_stats[ip] = {"total_checks": 0, "successful_checks": 0, "failed_checks": 0}
-
                 logging.info("Статусы и статистика успешно загружены из файла.")
         except Exception as e:
             logging.error(f"Ошибка при загрузке статусного файла: {e}")
@@ -112,24 +113,25 @@ def clean_old_stats():
     now = time.time()
     for ip, stats in server_stats.items():
         old_count = 0
+        server_name = next(server['name'] for server in SERVERS if server['ip'] == ip)
         while stats and stats[0][0] < now - MONITORING_WINDOW:
             stats.popleft()
             old_count += 1
         if old_count > 0:
-            logging.info(f"Удалено {old_count} старых записей для IP {ip}")
-            
+            logging.info(f"Удалено {old_count} старых записей для {server_name} ({ip})")
+
         # Рассчитываем успешные, неудачные проверки заново
         total_checks = len(stats)
         successful_checks = sum(1 for _, status in stats if status)
         failed_checks = total_checks - successful_checks
 
         # Логирование обновленной статистики
-        logging.info(f"Для IP {ip}: всего проверок - {total_checks}, успешных - {successful_checks}, неудачных - {failed_checks}")
+#        logging.info(f"Для IP {ip}: всего проверок - {total_checks}, успешных - {successful_checks}, неудачных - {failed_checks}")
 
 
 async def check_server(server, retries=3, delay=1):
     """
-    Проверяет доступность сервера через указанный порт (443) с использованием socket с несколькими повторами.
+    Проверяет доступность сервера через указанный порт (443) с использованием socket с несколькими попытками, если первая была неудачная.
 
     Возвращает:
     - "status": True/False (доступен/недоступен)
@@ -138,6 +140,7 @@ async def check_server(server, retries=3, delay=1):
     - "delay": Пауза между повторными попытками (в секундах).
     """
     ip = server["ip"]
+    server_name = next(server['name'] for server in SERVERS if server['ip'] == ip)
     for attempt in range(retries):
 
         try:
@@ -149,7 +152,7 @@ async def check_server(server, retries=3, delay=1):
                 conn.close()
                 return {"ip": ip, "status": True, "response_time": response_time}
         except (socket.timeout, socket.error) as e:
-            logging.info(f"Попытка подключения {attempt + 1} к серверу {ip} не удалась: {str(e)}")
+            logging.info(f"Попытка подключения {attempt + 1} к серверу {server_name} ({ip}) не удалась: {str(e)}")
             if attempt < retries - 1:
                 await asyncio.sleep(delay)  # Пауза перед повторной попыткой
             else:
@@ -222,10 +225,10 @@ def calculate_stats(ip):
 async def send_welcome(message: types.Message):
     adm = users
     if message.chat.id not in adm:
-        await message.answer('Это приватный бот, нехуй тебе здесь делать.\n\nВаш ID: '+ str(message.chat.id))
+        await message.answer('Это приватный бот, нехуй тебе здесь делать.\n\nВаш ID внесен в базу, это означает, что Вам ПИЗДА 🤪\n\nВаш ID: '+ str(message.chat.id))
     else:
-        await message.answer('Привет! Я на связи, всё путём 😉\n\nЕсли что забыл, ебани /help')
-        
+        await message.answer('Здарова, ёпта! Я на связи, всё путём 😉\n\nЕсли что-то забыл, ебани /help')
+
 #Обработчик команды /help
 @dp.message_handler(commands=["help"])
 async def send_welcome(message: types.Message):
@@ -233,7 +236,66 @@ async def send_welcome(message: types.Message):
     if message.chat.id not in adm:
         await message.answer('Я же сказал, нехуй тебе здесь делать!')
     else:
-        await message.answer('/status - текущий статус серверов\n\n/stats - общая статистика доступности серверов\n\n/graph - графики доступности серверов')
+        await message.answer('/status - текущий статус серверов\n\n/stats - общая статистика доступности серверов\n\n/graph - графики доступности серверов\n\n/log - просмотр логов')
+
+# Функция для отправки длинных сообщений частями
+async def send_long_message(chat_id, text):
+    # Если длина текста больше 4000 символов, разбиваем его на части
+    while len(text) > 4000:
+        await bot.send_message(chat_id, text[:4000])
+        text = text[4000:]
+    await bot.send_message(chat_id, text)
+
+#Обработчик команды /log (получаем логи из файла в чат)
+@dp.message_handler(commands=['log'])
+async def send_logs(message: types.Message):
+    adm = users
+    if message.chat.id not in adm:
+        await message.answer('Я же сказал, нехуй тебе здесь делать!')
+    else:
+        # Создаем инлайн кнопки для выбора числа (1-31)
+        days_buttons = [InlineKeyboardButton(str(i), callback_data=f"day_{i}") for i in range(1, 32)]
+        days_kb = InlineKeyboardMarkup(row_width=7).add(*days_buttons)
+        await message.answer("Выберите число:", reply_markup=days_kb)
+
+# Обработка выбора числа
+@dp.callback_query_handler(lambda callback: callback.data.startswith('day_'))
+async def process_day(callback_query: types.CallbackQuery):
+    day = callback_query.data.split('_')[1].zfill(2)  # Преобразуем число в формат "01", "02", и т.д.
+    # Создаем кнопки для выбора часа (0–23)
+    hours_buttons = [InlineKeyboardButton(f"{i}:00", callback_data=f"hour_{i}_{day.zfill(2)}") for i in range(24)]
+    hours_kb = InlineKeyboardMarkup(row_width=6).add(*hours_buttons)
+    await callback_query.message.answer(f"Вы выбрали {day} число. Теперь выберите час:", reply_markup=hours_kb)
+
+# Обработка выбора часа и отправка логов
+@dp.callback_query_handler(lambda callback: callback.data.startswith('hour_'))
+async def process_hour(callback_query: types.CallbackQuery):
+    callback_data = callback_query.data.split('_')
+    hour = int(callback_data[1])  # Час
+    day = callback_data[2]  # Число месяца
+
+    if os.path.exists('log/bot.log'):
+        try:
+            # Открываем файл с логами
+            with open('log/bot.log', 'r', encoding='utf-8') as file:
+                logs = file.readlines()
+
+            # Фильтруем логи по числу и часу
+            filtered_logs = [log for log in logs if f"-{day} " in log and log.split()[1].startswith(f"{hour:02}:")]
+
+            if filtered_logs:
+                # Объединяем отфильтрованные строки в одно сообщение
+                logs_text = "".join(filtered_logs)
+
+                # Отправляем логи в чат
+                await callback_query.message.answer(f"Логи за {day} число и {hour:02}:00 час:")
+                await send_long_message(callback_query.message.chat.id, logs_text)
+            else:
+                await callback_query.message.answer(f"Нет данных логов за {day} число и {hour:02}:00 час.")
+        except Exception as e:
+            await callback_query.message.answer(f"Ошибка при обработке файла логов: {e}")
+    else:
+        await callback_query.message.answer('Файл логов не найден.')
 
 #Обработчик команды /status для проверки текущего состояния серверов
 @dp.message_handler(commands=["status"])
@@ -337,20 +399,24 @@ async def send_eng(callback: types.CallbackQuery):
         ip = server["ip"]
         name = server["name"]
 
-        # Данные доступности сервера из статистики
-#        stats = server_stats.get(ip, deque(maxlen=max_checks))  # Последние max_checks записей
+        stats = server_stats.get(ip, deque())
+#        logging.info(f"Сервер {server['name']} ({ip}): всего записей: {len(stats)}")
+
         stats = server_stats.get(ip, deque())  # Получаем данные (все проверки)
         stats = list(islice(stats, max(len(stats) - max_checks, 0), len(stats)))  # Оставляем только последние max_checks записей
-        timestamps = [time.strftime('%H:%M:%S', time.localtime(ts)) for ts, _ in stats]  # Время на оси X
-        availability = [1 if status else 0 for _, status in stats]  # Преобразование True/False в 1/0
+#        logging.info(f"{name} ({ip}): Загружено {len(stats)} записей для отображения на графике")
+
+        timestamps = [datetime.fromtimestamp(ts) for ts, _ in stats]  # Преобразование меток времени в формат datetime вместо строк
+
+        availability = [1 if status else 0 for _, status in stats]  # Теперь заполняем переменную на основе stats
 
         # Обработка отсутствия данных
         if not availability:
-            timestamps = ['Нет данных']
+#            timestamps = ['Нет данных']
+            timestamps = [datetime.now()]  # Используем текущее время для пустых данных
             availability = [0]
 
-        # Добавляем вертикальный отступ (offset) для текущего сервера
-        offset = idx * offset_step
+        offset = idx * offset_step  # Добавляем вертикальный отступ (offset) для текущего сервера
         availability_with_offset = [a + offset for a in availability]  # Смещение значений
 
         # Построение ступенчатого графика
@@ -358,15 +424,19 @@ async def send_eng(callback: types.CallbackQuery):
 
         # Добавляем подписи рядом с каждой линией
         if timestamps:
-            plt.text(len(timestamps) // 2, offset + 0.9, f' {name}', color=colors[idx % len(colors)], fontsize=10, ha='center', va='center')
+            center_idx = len(timestamps) // 2  # Центр временных меток
+            plt.text(timestamps[center_idx], offset + 1.1, f' {name}', color=colors[idx % len(colors)], fontsize=10, ha='center', va='bottom')
 
     # Настройки отображения
-    plt.title('Доступность серверов с вертикальными отступами', fontsize=16)
+    plt.title('Доступность серверов с вертикальными отступами (последние 50 проверок)', fontsize=16)
     plt.xlabel('Время проверки', fontsize=12)
     plt.ylabel('Доступность', fontsize=12)
     plt.xticks(rotation=45, fontsize=10)  # Поворот подписей временной оси
     plt.yticks([], [])  # Убираем автоматически создаваемые метки на оси Y
     plt.grid(axis='x', linestyle='--', alpha=0.7)
+    plt.gca().xaxis.set_major_locator(mdates.MinuteLocator(interval=2))  # Каждая 2 минута
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))  # Формат HH:MM:SS
+    plt.gcf().autofmt_xdate()  # Автоматически форматируем метки времени
 
     # Легенда для графика
     plt.legend(title='Сервера', fontsize=10)
@@ -389,7 +459,7 @@ async def send_eng(callback: types.CallbackQuery):
     os.remove(graph_path)
 
 
-#Обработчик кнопок с построение графиков (временные диапазоны)
+#Обработчик кнопок с построение графиков (временные диапазаны)
 @dp.callback_query_handler(lambda call: call.data.startswith("graph_"))
 async def send_graph_callback(call: types.CallbackQuery):
     """
@@ -417,8 +487,8 @@ async def send_graph_callback(call: types.CallbackQuery):
     colors = ['blue', 'green', 'orange', 'red', 'purple', 'cyan', 'magenta']
     offset_step = 1.5  # Отступ по оси Y между серверами
 
-#    plt.figure(figsize=(12, 10))  # Размер изображения
-    plt.figure(figsize=(23, 10))  # Размер изображения
+    plt.figure(figsize=(16, 10))  # Размер изображения
+#    plt.figure(figsize=(23, 10))  # Размер изображения
 
     now = time.time()
 
@@ -441,13 +511,14 @@ async def send_graph_callback(call: types.CallbackQuery):
                 reduced_stats.append((timestamp, status))
                 last_status = status
 
-        # Преобразование данных в удобный для построения формат
-        timestamps = [time.strftime('%H:%M', time.localtime(ts)) for ts, _ in reduced_stats]
-        availability = [1 if status else 0 for _, status in reduced_stats]
+        timestamps = [datetime.fromtimestamp(ts) for ts, _ in reduced_stats]  # Преобразуем временные метки в формат datetime
+
+        availability = [1 if status else 0 for _, status in reduced_stats]  # Теперь заполняем переменную на основе stats
 
         # Если данных недостаточно, добавляем заглушки
         if not availability:
-            timestamps = ['Нет данных']
+#            timestamps = ['Нет данных']
+            timestamps = [datetime.now()]  # Используем текущее время в качестве заглушки
             availability = [0]
 
         # Добавляем вертикальный офсет (отступ по Y) для сервера
@@ -459,15 +530,29 @@ async def send_graph_callback(call: types.CallbackQuery):
 
         # Добавляем подпись рядом с сервером
         if timestamps:
-            plt.text(len(timestamps) // 2, offset + 0.9, f' {name}', color=colors[idx % len(colors)], fontsize=10, ha='center', va='center')
+            center_idx = len(timestamps) // 2  # Центр временных меток
+            plt.text(timestamps[center_idx], offset + 1.1, f' {name}', color=colors[idx % len(colors)], fontsize=10, ha='center', va='bottom')
 
     # Настройки графика
     plt.title(f'Доступность серверов за последние {hours} часов', fontsize=16)
     plt.xlabel('Время проверки', fontsize=12)
     plt.ylabel('Доступность', fontsize=12)
-    plt.xticks(fontsize=8, rotation=45)  # Поворот временных меток
+    plt.xticks(rotation=45, fontsize=10)  # Поворот временных меток
     plt.yticks([], [])  # Убираем автоматические метки на оси Y
     plt.grid(axis='x', linestyle='--', alpha=0.7)
+    if hours == 24:
+        plt.gca().xaxis.set_major_locator(mdates.MinuteLocator(interval=60))  # Каждые 60 минут
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # Формат отображения: ЧЧ:ММ
+    elif hours == 12:
+        plt.gca().xaxis.set_major_locator(mdates.MinuteLocator(interval=30))  # Каждые 30 минут
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # Формат отображения: ЧЧ:ММ
+    elif hours == 6:
+        plt.gca().xaxis.set_major_locator(mdates.MinuteLocator(interval=10))  # Каждые 10 минут
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # Формат отображения: ЧЧ:ММ
+    else:
+        plt.gca().xaxis.set_major_locator(mdates.MinuteLocator(interval=2))  # Каждые 2 минуты
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # Формат отображения: ЧЧ:ММ
+    plt.gcf().autofmt_xdate()  # Автоматическое форматирование меток времени
 
     # Добавляем легенду
     plt.legend(title='Сервера', fontsize=10)
@@ -496,7 +581,7 @@ async def text(message: types.Message):
     if message.chat.id not in adm:
         await message.answer('Я же сказал, нехуй тебе здесь делать!')
     else:
-        await message.answer('Я ничего не обрабатываю, кроме команд /status, /stats, /graph')
+        await message.answer('Ну ты чё ебанулся? Я же ничего не обрабатываю, кроме определенных команд.\n\nЕсли что-то забыл, ебани /help')
 
 async def scheduled_monitoring():
     """
